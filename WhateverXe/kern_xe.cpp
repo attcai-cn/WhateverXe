@@ -7271,18 +7271,34 @@ bool XE::processDisplay13FramebufferSST(KernelPatcher &patcher,size_t index,mach
 
 // Called with the display owner lock held. The native caller owns the port;
 // require its retained platform record and BAR association before sampling it.
-uint8_t *XE::display13SSTPort(void *port) {
- auto s=callbackXE;auto &c=display13FBPower;auto object=static_cast<OSObject *>(port);
- if(!s->display13FramebufferRequested || s->xeProfile.display!=XELP::Display::XeLPD || !s->display13FBSSTHooksReady ||
-    !object || object->getMetaClass()->getClassSize()<0x624 || !c.controller ||
-    c.controller!=s->adlnTopologyController || !adlnWriterMappingBound() ||
-    c.clockFaulted || c.memoryFaulted || c.panelFaulted || c.clockStopped || !s->adlnOutputWiring.described())return nullptr;
- auto p=static_cast<uint8_t *>(port);auto config=Display13FBMemory::field<uint32_t *>(p,0x548);
- if(!Display13FBTopology::selected(s->adlnPlatform,config,s->adlnOutputWiring) ||
-    !(s->adlnOutputWiring.links()&(1U<<config[0])) || p[0x117] ||
-    Display13FBMemory::field<uint32_t>(p,0x120)!=config[0] || Display13FBMemory::field<uint32_t>(p,0x550)!=(config[0]>=3?4U:1U) ||
-    Display13FBMemory::field<void *>(p,0x578)!=c.access)return nullptr;
- return p;
+// 'reason' reports the first rejected precondition (0 = accepted). The codes
+// are stable so a rejected handoff can be identified from a CPU-only snapshot.
+uint8_t *XE::display13SSTPort(void *port,uint32_t *reason) {
+    auto s=callbackXE;auto &c=display13FBPower;auto object=static_cast<OSObject *>(port);
+    auto fail=[&](uint32_t code)->uint8_t * { if(reason)*reason=code; return nullptr; };
+    if(!s->display13FramebufferRequested)return fail(1);
+    if(s->xeProfile.display!=XELP::Display::XeLPD)return fail(2);
+    if(!s->display13FBSSTHooksReady)return fail(3);
+    if(!object)return fail(4);
+    if(object->getMetaClass()->getClassSize()<0x624)return fail(5);
+    if(!c.controller)return fail(6);
+    if(c.controller!=s->adlnTopologyController)return fail(7);
+    if(!adlnWriterMappingBound())return fail(8);
+    if(c.clockFaulted)return fail(9);
+    if(c.memoryFaulted)return fail(10);
+    if(c.panelFaulted)return fail(11);
+    if(c.clockStopped)return fail(12);
+    if(!s->adlnOutputWiring.described())return fail(13);
+    auto p=static_cast<uint8_t *>(port);auto config=Display13FBMemory::field<uint32_t *>(p,0x548);
+    if(!config||config[0]>=Display13FBTopology::Ports)return fail(14);
+    if(!Display13FBTopology::selected(s->adlnPlatform,config,s->adlnOutputWiring))return fail(15);
+    if(!(s->adlnOutputWiring.links()&(1U<<config[0])))return fail(16);
+    if(p[0x117])return fail(17);
+    if(Display13FBMemory::field<uint32_t>(p,0x120)!=config[0])return fail(18);
+    if(Display13FBMemory::field<uint32_t>(p,0x550)!=(config[0]>=3?4U:1U))return fail(19);
+    if(Display13FBMemory::field<void *>(p,0x578)!=c.access)return fail(20);
+    if(reason)*reason=0;
+    return p;
 }
 
 bool XE::display13HDMIPort(void *port) {
@@ -8130,8 +8146,35 @@ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop)
 			if(!c.bridge.bootAdopted) {
                 const auto ddi=c.bridge.bootPort;
                 const bool dp=ddi<7 && (callbackXE->adlnOutputWiring.links()&(1U<<ddi));
+                const bool panel=ddi<7 && (callbackXE->adlnOutputWiring.panel&(1U<<ddi))!=0;
                 bool linked=!dp;
-                if(dp && display13SSTPort(port)) {
+                uint32_t sstReason=0;
+                uint8_t *sst=dp ? display13SSTPort(port,&sstReason) : nullptr;
+                // The donor's SST port object describes an external DP/HDMI link.
+                // An internal eDP panel is driven by the firmware GOP over the
+                // embedded DisplayPort link of the same Combo port, so that
+                // external-link object shape must not veto the panel handoff.
+                // Only the identity, ownership and health facts that the
+                // handoff itself depends on are required here; the DP source
+                // proof and the AUX main-link lease stay mandatory below.
+                uint64_t gate[12] {1,ddi,dp,panel,sst!=nullptr,sstReason,0,0,0,0,0,0};
+                uint8_t *relaxed=nullptr;
+                if(dp && !sst && panel) {
+                    auto p=reinterpret_cast<uint8_t *>(port);
+                    auto object=static_cast<OSObject *>(port);
+                    auto config=Display13FBMemory::field<uint32_t *>(p,0x548);
+                    const bool size=object && object->getMetaClass()->getClassSize()>=0x580;
+                    const bool identity=size && config && config[0]<Display13FBTopology::Ports &&
+                        Display13FBMemory::field<uint32_t>(p,0x120)==config[0] && config[0]==ddi;
+                    const bool owner=size && Display13FBMemory::field<void *>(p,0x578)==c.access;
+                    const bool link=size && !p[0x117];
+                    const bool health=!c.clockFaulted && !c.memoryFaulted && !c.clockStopped && !c.panelFaulted;
+                    gate[6]=size;gate[7]=identity;gate[8]=owner;gate[9]=link;gate[10]=health;
+                    gate[11]=Display13FBMemory::field<uint32_t>(p,0x550);
+                    if(size&&identity&&owner&&link&&health)relaxed=p;
+                }
+                IORegistryEntry::getRegistryRoot()->setProperty("N97FBHandoffGate",gate,sizeof(gate));
+                if(dp && (sst || relaxed)) {
                     Display13FBBootIO io{c.map};auto &boot=c.displayScratch;AlderLakeN::readDisplay(io,true,boot);
                     if(ddi>=3) {
                         const auto source=Display13TC::Boot::capture(io,true,ddi,0);
@@ -8139,7 +8182,7 @@ void XE::wrapAlderLakeNSetupWorkLoop(IOService *controller,IOWorkLoop *workLoop)
                         linked=tc.owned(ddi) && tc.linkHeld() && boot.activePipes==1 &&
                             AlderLakeN::dpSourceUnchanged(io,boot,0,ddi,0,&source);
                     } else if(ddi<2) {
-                        result=AlderLakeN::adoptDPBootAUX(io,boot,c.bridge,c.mainLink[ddi],reinterpret_cast<uintptr_t>(port),ddi,(callbackXE->adlnOutputWiring.panel&(1U<<ddi))!=0);
+                        result=AlderLakeN::adoptDPBootAUX(io,boot,c.bridge,c.mainLink[ddi],reinterpret_cast<uintptr_t>(port),ddi,panel);
                         linked=result.status==Display13Power::Status::Complete;
                         if(linked)port->retain(); // Released only after real buffer stop/idle.
                     }
